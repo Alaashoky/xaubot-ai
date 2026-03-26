@@ -53,7 +53,11 @@ def fetch_training_data(
     timeframe: str,
     bars: int = 5000,
 ) -> pl.DataFrame:
-    """Fetch historical data for training."""
+    """Fetch historical data for training (legacy fallback – uses last N bars).
+    
+    Kept for backward compatibility. Prefer fetch_data_by_date_range() for
+    reproducible, date-bounded datasets.
+    """
     logger.info(f"Fetching {bars} bars of {symbol} {timeframe} data...")
     
     df = connector.get_market_data(symbol, timeframe, bars)
@@ -64,6 +68,73 @@ def fetch_training_data(
     logger.info(f"Received {len(df)} bars")
     logger.info(f"Date range: {df['time'].min()} to {df['time'].max()}")
     
+    return df
+
+
+def fetch_data_by_date_range(
+    connector: MT5Connector,
+    symbol: str,
+    timeframe: str,
+    date_from: datetime,
+    date_to: datetime,
+) -> pl.DataFrame:
+    """Fetch historical data between two specific dates using MT5 copy_rates_range.
+    
+    Args:
+        connector: Active MT5Connector instance.
+        symbol:    Trading symbol, e.g. "XAUUSD".
+        timeframe: Timeframe string, e.g. "M15".
+        date_from: Start of the requested period (inclusive).
+        date_to:   End of the requested period (inclusive).
+    
+    Returns:
+        Polars DataFrame with OHLCV data.
+    """
+    try:
+        import MetaTrader5 as mt5_api
+    except ImportError:
+        raise RuntimeError("MetaTrader5 package is not installed.")
+
+    logger.info(f"Fetching {symbol} {timeframe} from {date_from} to {date_to}...")
+
+    connector.connect()
+
+    tf_map = connector.TIMEFRAMES
+    tf = tf_map.get(timeframe.upper())
+    if tf is None:
+        raise ValueError(f"Invalid timeframe: {timeframe}")
+
+    mt5_api.symbol_select(symbol, True)
+
+    rates = mt5_api.copy_rates_range(symbol, tf, date_from, date_to)
+
+    if rates is None or len(rates) == 0:
+        raise ValueError(
+            f"No data received from MT5 for {symbol} {timeframe} "
+            f"between {date_from} and {date_to}"
+        )
+
+    df = pl.DataFrame({
+        "time":        pl.Series(rates["time"]),
+        "open":        pl.Series(rates["open"].astype(float)),
+        "high":        pl.Series(rates["high"].astype(float)),
+        "low":         pl.Series(rates["low"].astype(float)),
+        "close":       pl.Series(rates["close"].astype(float)),
+        "tick_volume": pl.Series(rates["tick_volume"]),
+        "spread":      pl.Series(rates["spread"]),
+        "real_volume": pl.Series(rates["real_volume"]),
+    })
+
+    df = df.with_columns([
+        pl.from_epoch(pl.col("time"), time_unit="s").alias("time"),
+        pl.col("open").cast(pl.Float64),
+        pl.col("high").cast(pl.Float64),
+        pl.col("low").cast(pl.Float64),
+        pl.col("close").cast(pl.Float64),
+        pl.col("tick_volume").cast(pl.Int64).alias("volume"),
+    ]).drop("tick_volume")
+
+    logger.info(f"Fetched {len(df)} bars | {df['time'].min()} → {df['time'].max()}")
     return df
 
 
@@ -230,30 +301,46 @@ def main():
         return
     
     try:
-        # Fetch data - MORE DATA for better generalization
-        df = fetch_training_data(
-            connector,
-            config.symbol,
-            config.execution_timeframe,
-            bars=15000,  # Increased for better HMM regime separation
+        # ====== تعريف فترات التدريب والباكتيست ======
+        TRAIN_FROM = datetime(2020, 1, 1)
+        TRAIN_TO   = datetime(2023, 12, 31)
+        TEST_FROM  = datetime(2024, 1, 1)
+        TEST_TO    = datetime(2026, 3, 26)
+
+        logger.info(f"Training period : {TRAIN_FROM.date()} → {TRAIN_TO.date()}")
+        logger.info(f"Backtest period : {TEST_FROM.date()} → {TEST_TO.date()}")
+
+        # جيب بيانات التدريب (2020-2023)
+        df_train = fetch_data_by_date_range(
+            connector, config.symbol, config.execution_timeframe,
+            TRAIN_FROM, TRAIN_TO
         )
-        
-        # Prepare features
-        df = prepare_features(df)
-        
-        # Save raw data
-        save_training_data(df)
-        
-        # Train HMM
-        hmm_model = train_hmm_model(df)
-        
-        # Add regime to features
+
+        # جيب بيانات الباكتيست (2024-2026)
+        df_test = fetch_data_by_date_range(
+            connector, config.symbol, config.execution_timeframe,
+            TEST_FROM, TEST_TO
+        )
+
+        # Feature engineering على بيانات التدريب
+        df_train = prepare_features(df_train)
+        save_training_data(df_train, "data/training_data_2020_2023.parquet")
+
+        # Feature engineering على بيانات الباكتيست
+        df_test = prepare_features(df_test)
+        save_training_data(df_test, "data/backtest_data_2024_2026.parquet")
+
+        # Train HMM على بيانات التدريب فقط
+        hmm_model = train_hmm_model(df_train)
+
+        # تطبيق النموذج المدرَّب على كلا المجموعتين
         if hmm_model.fitted:
-            df = hmm_model.predict(df)
-        
-        # Train XGBoost
-        xgb_model = train_xgboost_model(df)
-        
+            df_train = hmm_model.predict(df_train)
+            df_test  = hmm_model.predict(df_test)
+
+        # Train XGBoost على بيانات التدريب فقط
+        xgb_model = train_xgboost_model(df_train)
+
         # Summary
         logger.info("=" * 60)
         logger.info("TRAINING COMPLETE")
@@ -262,6 +349,13 @@ def main():
         logger.info(f"XGBoost Model: {'SAVED' if xgb_model.fitted else 'FAILED'}")
         logger.info(f"Models saved in: models/")
         logger.info(f"Training data saved in: data/")
+        logger.info("=" * 60)
+        logger.info("DATASET SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"Training set : {len(df_train):,} bars | {TRAIN_FROM.date()} → {TRAIN_TO.date()}")
+        logger.info(f"Backtest set : {len(df_test):,} bars | {TEST_FROM.date()} → {TEST_TO.date()}")
+        logger.info(f"Train file   : data/training_data_2020_2023.parquet")
+        logger.info(f"Test file    : data/backtest_data_2024_2026.parquet")
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
